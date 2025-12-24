@@ -12,7 +12,7 @@ type Group[F ~func() | ~func(context.Context) error] interface {
 }
 
 var (
-	_ Group[func()] = NewTasksGroup()
+	_ Group[func()]                      = NewTasksGroup()
 	_ Group[func(context.Context) error] = NewErrGroup()
 	_ Group[func(context.Context) error] = NewRaceGroup()
 )
@@ -75,28 +75,46 @@ type group struct {
 	err      error
 }
 
-func (b *group) init() {
-	b.initOnce.Do(func() {
-		if b.ctx == nil {
-			b.ctx = context.Background()
+func (g *group) init() {
+	g.initOnce.Do(func() {
+		if g.ctx == nil {
+			g.ctx = context.Background()
 		}
 
-		b.ctx, b.cancel = context.WithCancelCause(context.Background())
+		g.ctx, g.cancel = context.WithCancelCause(g.ctx)
 	})
 }
 
-func (b *group) WithContext(ctx context.Context) {
-	b.ctx = ctx
+func (g *group) ErrOnceFunc(f func() error) {
+	g.errOnce.Do(func() {
+		g.err = f()
+	})
 }
 
-func (b *group) wait() error {
+func (g *group) WithContext(ctx context.Context) {
+	g.ctx = ctx
+}
+
+func (g *group) Context() context.Context {
+	return g.ctx
+}
+
+func (g *group) Cancel(err error) {
+	g.cancel(err)
+}
+
+func (g *group) Wait() error {
 	defer func() {
-		b.initOnce = sync.Once{}
-		b.errOnce = sync.Once{}
+		g.initOnce = sync.Once{}
+		g.errOnce = sync.Once{}
 	}()
 
-	b.tasks.Wait()
-	return b.err
+	g.tasks.Wait()
+	return g.err
+}
+
+func (g *group) Go(f func()) {
+	g.tasks.Go(f)
 }
 
 type raceGroup struct {
@@ -118,17 +136,17 @@ func (r *raceGroup) WithContext(ctx context.Context) *raceGroup {
 
 func (r *raceGroup) Go(f func(ctx context.Context) error) {
 	r.group.init()
-	r.group.tasks.Go(func() {
-		err := f(r.group.ctx)
-		r.group.errOnce.Do(func() {
-			r.group.err = err
-			r.group.cancel(r.group.err)
+	r.group.Go(func() {
+		err := f(r.group.Context())
+		r.group.ErrOnceFunc(func() error {
+			r.group.Cancel(err)
+			return err
 		})
 	})
 }
 
 func (r *raceGroup) Wait() error {
-	return r.group.wait()
+	return r.group.Wait()
 }
 
 type errGroup struct {
@@ -145,11 +163,11 @@ func NewErrGroup() *errGroup {
 
 func (g *errGroup) Go(f func(ctx context.Context) error) {
 	g.group.init()
-	g.group.tasks.Go(func() {
-		if err := f(g.group.ctx); err != nil {
-			g.group.errOnce.Do(func() {
-				g.group.err = err
-				g.group.cancel(g.group.err)
+	g.group.Go(func() {
+		if err := f(g.group.Context()); err != nil {
+			g.group.ErrOnceFunc(func() error {
+				g.group.Cancel(err)
+				return err
 			})
 		}
 	})
@@ -161,5 +179,5 @@ func (g *errGroup) WithContext(ctx context.Context) *errGroup {
 }
 
 func (g *errGroup) Wait() error {
-	return g.group.wait()
+	return g.group.Wait()
 }
