@@ -1,4 +1,4 @@
-package goscope
+package goscope_test
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Arkissa/goscope"
 )
 
 func TestTaskGroup(t *testing.T) {
@@ -21,7 +23,7 @@ func TestTaskGroup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tg := NewTasksGroup()
+			tg := goscope.NewTasksGroup()
 			var counter atomic.Int32
 
 			for i := 0; i < tt.tasks; i++ {
@@ -43,14 +45,15 @@ func TestTaskGroup(t *testing.T) {
 }
 
 func TestRaceGroup(t *testing.T) {
+	var ErrFaild = errors.New("failed running")
 	tests := []struct {
 		name    string
-		do      func(*raceGroup) error
+		do      func(goscope.Group[func(context.Context) error]) error
 		wantErr bool
 	}{
 		{
 			name: "fast error cancels slower task",
-			do: func(rg *raceGroup) error {
+			do: func(rg goscope.Group[func(context.Context) error]) error {
 				rg.Go(func(ctx context.Context) error {
 					select {
 					case <-ctx.Done():
@@ -62,7 +65,7 @@ func TestRaceGroup(t *testing.T) {
 
 				rg.Go(func(ctx context.Context) error {
 					time.Sleep(100 * time.Millisecond)
-					return errors.New("failed running")
+					return ErrFaild
 				})
 
 				return rg.Wait()
@@ -70,12 +73,16 @@ func TestRaceGroup(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "fast success cancels others",
-			do: func(rg *raceGroup) error {
+			name: "fast success cancels others task",
+			do: func(rg goscope.Group[func(context.Context) error]) error {
 				rg.Go(func(ctx context.Context) error { return nil })
 				rg.Go(func(ctx context.Context) error {
-					<-ctx.Done()
-					return ctx.Err()
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(200 * time.Millisecond):
+						return ErrFaild
+					}
 				})
 
 				return rg.Wait()
@@ -86,7 +93,7 @@ func TestRaceGroup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotErr := tt.do(NewRaceGroup())
+			gotErr := tt.do(goscope.NewRaceGroup())
 
 			if gotErr != nil {
 				if !tt.wantErr {
@@ -102,42 +109,85 @@ func TestRaceGroup(t *testing.T) {
 }
 
 func TestErrGroup(t *testing.T) {
+	var (
+		ErrFaild = errors.New("faild")
+		ErrSecondFaild = errors.New("second faild")
+	)
 	tests := []struct {
-		name    string
-		setup   func(*errGroup) error
-		wantErr bool
+		name         string
+		do           func() error
+		wantErr      bool
+		wantErrValue error
 	}{
 		{
-			name: "captures first error and cancels",
-			setup: func(eg *errGroup) error {
-				eg.Go(func(ctx context.Context) error { return errors.New("fail") })
+			name: "captures first error and cancel others",
+			do: func() error {
+				eg := goscope.NewErrGroup().WithContext(context.Background())
+				eg.Go(func(ctx context.Context) error { return ErrFaild })
 				eg.Go(func(ctx context.Context) error {
-					<-ctx.Done()
-					return ctx.Err()
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(200 * time.Millisecond):
+						return nil
+					}
 				})
 				return eg.Wait()
 			},
 			wantErr: true,
+			wantErrValue: ErrFaild,
 		},
 		{
 			name: "all success returns nil",
-			setup: func(eg *errGroup) error {
+			do: func() error {
+				eg := goscope.NewErrGroup()
 				eg.Go(func(ctx context.Context) error { return nil })
 				eg.Go(func(ctx context.Context) error { return nil })
-				return nil
+				return eg.Wait()
 			},
 			wantErr: false,
+		},
+		{
+			name: "captures first error but delay",
+			do: func() error {
+				eg := goscope.NewErrGroup()
+				eg.Go(func(ctx context.Context) error { return nil })
+				eg.Go(func(ctx context.Context) error {
+					time.Sleep(200 * time.Millisecond)
+					return ErrFaild
+				})
+				return eg.Wait()
+			},
+			wantErr: true,
+			wantErrValue: ErrFaild,
+		},
+		{
+			name: "captures first error",
+			do: func() error {
+				eg := goscope.NewErrGroup()
+				eg.Go(func(ctx context.Context) error { return ErrFaild })
+				eg.Go(func(ctx context.Context) error {
+					time.Sleep(200 * time.Millisecond)
+					return ErrSecondFaild
+				})
+				return eg.Wait()
+			},
+			wantErr: true,
+			wantErrValue: ErrFaild,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			eg := NewErrGroup()
-			gotErr := tt.setup(eg)
+			gotErr := tt.do()
 
 			if gotErr != nil {
 				if !tt.wantErr {
 					t.Errorf("Wait() failed: %v", gotErr)
+				}
+
+				if !errors.Is(gotErr, tt.wantErrValue) {
+					t.Errorf("Wait() want: %v, but got: %v", tt.wantErrValue, gotErr)
 				}
 				return
 			}
